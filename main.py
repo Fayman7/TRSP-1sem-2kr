@@ -1,15 +1,22 @@
+import os
 import uuid
 from typing import Optional
 
 from fastapi import Body, Cookie, FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from itsdangerous import BadSignature, Signer
 from pydantic import BaseModel, EmailStr, Field
 
 app = FastAPI()
 
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-for-cookie-signing")
+SESSION_SIGNER = Signer(SECRET_KEY)
+SESSION_MAX_AGE = 3600
+
 VALID_USERS: dict[str, dict] = {
     "user123": {
         "password": "password123",
+        "user_id": str(uuid.uuid4()),
         "profile": {
             "username": "user123",
             "email": "user123@example.com",
@@ -17,7 +24,9 @@ VALID_USERS: dict[str, dict] = {
         },
     },
 }
-SESSIONS: dict[str, str] = {}
+USERS_BY_ID: dict[str, dict] = {
+    user["user_id"]: user for user in VALID_USERS.values()
+}
 
 SAMPLE_PRODUCT_1 = {
     "product_id": 123,
@@ -79,16 +88,38 @@ def verify_credentials(username: str, password: str) -> bool:
     return user is not None and user["password"] == password
 
 
-def create_session(username: str) -> str:
-    token = str(uuid.uuid4())
-    SESSIONS[token] = username
-    return token
+def is_valid_user_id(user_id: str) -> bool:
+    try:
+        uuid.UUID(user_id)
+        return True
+    except ValueError:
+        return len(user_id) >= 8 and user_id.isalnum()
 
 
-def get_username_from_session(session_token: Optional[str]) -> Optional[str]:
+def create_signed_session_token(user_id: str) -> str:
+    signed = SESSION_SIGNER.sign(user_id)
+    return signed.decode() if isinstance(signed, bytes) else signed
+
+
+def get_user_id_from_session_token(session_token: Optional[str]) -> Optional[str]:
     if not session_token:
         return None
-    return SESSIONS.get(session_token)
+    if isinstance(session_token, bytes):
+        session_token = session_token.decode()
+    try:
+        user_id = SESSION_SIGNER.unsign(session_token)
+    except BadSignature:
+        return None
+    if isinstance(user_id, bytes):
+        user_id = user_id.decode()
+    if not is_valid_user_id(user_id):
+        return None
+    return user_id
+
+
+def get_profile_by_user_id(user_id: str) -> Optional[dict]:
+    user = USERS_BY_ID.get(user_id)
+    return user["profile"] if user else None
 
 
 def unauthorized() -> JSONResponse:
@@ -137,11 +168,13 @@ def _login_response(
     if not verify_credentials(username, password):
         return unauthorized()
 
-    session_token = create_session(username)
+    user_id = VALID_USERS[username]["user_id"]
+    session_token = create_signed_session_token(user_id)
     response.set_cookie(
         key="session_token",
         value=session_token,
         httponly=True,
+        max_age=SESSION_MAX_AGE,
         secure=request.url.scheme == "https",
         samesite="lax",
     )
@@ -183,9 +216,21 @@ async def login_form(
     return _login_response(request, response, username, password)
 
 
+def _profile_response(session_token: Optional[str]):
+    user_id = get_user_id_from_session_token(session_token)
+    if user_id is None:
+        return unauthorized()
+    profile = get_profile_by_user_id(user_id)
+    if profile is None:
+        return unauthorized()
+    return profile
+
+
+@app.get("/profile")
+def get_profile(session_token: Optional[str] = Cookie(default=None)):
+    return _profile_response(session_token)
+
+
 @app.get("/user")
 def get_user_profile(session_token: Optional[str] = Cookie(default=None)):
-    username = get_username_from_session(session_token)
-    if username is None:
-        return unauthorized()
-    return VALID_USERS[username]["profile"]
+    return _profile_response(session_token)
