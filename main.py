@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from typing import Optional
 
@@ -11,7 +12,10 @@ app = FastAPI()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-for-cookie-signing")
 SESSION_SIGNER = Signer(SECRET_KEY)
-SESSION_MAX_AGE = 3600
+
+SESSION_INACTIVITY_TIMEOUT = 300  # сессия истекает через 5 минут без активности
+SESSION_EXTEND_AFTER = 180  # продление, если прошло >= 3 минут с последней активности
+SESSION_COOKIE_MAX_AGE = 300  # max_age куки — 5 минут
 
 VALID_USERS: dict[str, dict] = {
     "user123": {
@@ -96,25 +100,38 @@ def is_valid_user_id(user_id: str) -> bool:
         return len(user_id) >= 8 and user_id.isalnum()
 
 
-def create_signed_session_token(user_id: str) -> str:
-    signed = SESSION_SIGNER.sign(user_id)
-    return signed.decode() if isinstance(signed, bytes) else signed
+def _decode_signed_value(value: str | bytes) -> str:
+    return value.decode() if isinstance(value, bytes) else value
 
 
-def get_user_id_from_session_token(session_token: Optional[str]) -> Optional[str]:
+def create_signed_session_token(user_id: str, last_activity: int) -> str:
+    payload = f"{user_id}.{last_activity}"
+    signed = SESSION_SIGNER.sign(payload)
+    return _decode_signed_value(signed)
+
+
+def parse_signed_session_token(
+    session_token: Optional[str],
+) -> tuple[Optional[str], Optional[int], bool]:
+    """Возвращает (user_id, last_activity, is_invalid). is_invalid=True при подделке."""
     if not session_token:
-        return None
-    if isinstance(session_token, bytes):
-        session_token = session_token.decode()
+        return None, None, False
+    session_token = _decode_signed_value(session_token)
     try:
-        user_id = SESSION_SIGNER.unsign(session_token)
+        payload = SESSION_SIGNER.unsign(session_token)
     except BadSignature:
-        return None
-    if isinstance(user_id, bytes):
-        user_id = user_id.decode()
+        return None, None, True
+    payload = _decode_signed_value(payload)
+    if "." not in payload:
+        return None, None, True
+    user_id, timestamp_str = payload.rsplit(".", 1)
     if not is_valid_user_id(user_id):
-        return None
-    return user_id
+        return None, None, True
+    try:
+        last_activity = int(timestamp_str)
+    except ValueError:
+        return None, None, True
+    return user_id, last_activity, False
 
 
 def get_profile_by_user_id(user_id: str) -> Optional[dict]:
@@ -122,8 +139,55 @@ def get_profile_by_user_id(user_id: str) -> Optional[dict]:
     return user["profile"] if user else None
 
 
+def session_expired() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"message": "Session expired"})
+
+
+def invalid_session() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"message": "Invalid session"})
+
+
 def unauthorized() -> JSONResponse:
     return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+
+
+def set_session_cookie(response: Response, user_id: str, last_activity: int) -> None:
+    response.set_cookie(
+        key="session_token",
+        value=create_signed_session_token(user_id, last_activity),
+        httponly=True,
+        max_age=SESSION_COOKIE_MAX_AGE,
+        secure=False,
+        samesite="lax",
+    )
+
+
+def validate_and_refresh_session(
+    session_token: Optional[str],
+    response: Response,
+    now: Optional[int] = None,
+) -> tuple[Optional[str], Optional[JSONResponse]]:
+    """
+    Проверяет сессию по серверному времени.
+    Возвращает (user_id, error_response). При продлении обновляет куку в response.
+    """
+    if now is None:
+        now = int(time.time())
+
+    user_id, last_activity, is_invalid = parse_signed_session_token(session_token)
+    if is_invalid:
+        return None, invalid_session()
+    if user_id is None or last_activity is None:
+        return None, session_expired()
+
+    elapsed = now - last_activity
+    if elapsed >= SESSION_INACTIVITY_TIMEOUT:
+        return None, session_expired()
+
+    if SESSION_EXTEND_AFTER <= elapsed < SESSION_INACTIVITY_TIMEOUT:
+        set_session_cookie(response, user_id, now)
+
+    return user_id, None
 
 
 def handle_create_user(user: UserCreate) -> dict:
@@ -160,7 +224,6 @@ def get_product(product_id: int) -> dict:
 
 
 def _login_response(
-    request: Request,
     response: Response,
     username: str,
     password: str,
@@ -169,15 +232,7 @@ def _login_response(
         return unauthorized()
 
     user_id = VALID_USERS[username]["user_id"]
-    session_token = create_signed_session_token(user_id)
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        max_age=SESSION_MAX_AGE,
-        secure=request.url.scheme == "https",
-        samesite="lax",
-    )
+    set_session_cookie(response, user_id, int(time.time()))
     return {"message": "Login successful"}
 
 
@@ -189,7 +244,6 @@ def _login_response(
 )
 async def login(
     response: Response,
-    request: Request,
     credentials: LoginRequest = Body(
         ...,
         examples={
@@ -200,7 +254,7 @@ async def login(
         },
     ),
 ):
-    result = _login_response(request, response, credentials.username, credentials.password)
+    result = _login_response(response, credentials.username, credentials.password)
     if isinstance(result, JSONResponse):
         return result
     return LoginResponse(**result)
@@ -208,29 +262,38 @@ async def login(
 
 @app.post("/login/form", include_in_schema=False, response_model=None)
 async def login_form(
-    request: Request,
     response: Response,
     username: str = Form(...),
     password: str = Form(...),
 ):
-    return _login_response(request, response, username, password)
+    return _login_response(response, username, password)
 
 
-def _profile_response(session_token: Optional[str]):
-    user_id = get_user_id_from_session_token(session_token)
-    if user_id is None:
-        return unauthorized()
+def _profile_response(
+    session_token: Optional[str],
+    response: Response,
+    now: Optional[int] = None,
+):
+    user_id, error = validate_and_refresh_session(session_token, response, now)
+    if error is not None:
+        return error
     profile = get_profile_by_user_id(user_id)
     if profile is None:
-        return unauthorized()
+        return invalid_session()
     return profile
 
 
 @app.get("/profile")
-def get_profile(session_token: Optional[str] = Cookie(default=None)):
-    return _profile_response(session_token)
+def get_profile(
+    response: Response,
+    session_token: Optional[str] = Cookie(default=None),
+):
+    return _profile_response(session_token, response)
 
 
 @app.get("/user")
-def get_user_profile(session_token: Optional[str] = Cookie(default=None)):
-    return _profile_response(session_token)
+def get_user_profile(
+    response: Response,
+    session_token: Optional[str] = Cookie(default=None),
+):
+    return _profile_response(session_token, response)
