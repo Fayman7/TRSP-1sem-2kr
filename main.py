@@ -297,3 +297,19 @@ def get_user_profile(
     session_token: Optional[str] = Cookie(default=None),
 ):
     return _profile_response(session_token, response)
+
+
+@app.get("/headers")
+def get_request_headers(request: Request) -> dict[str, str]:
+    user_agent = request.headers.get("user-agent")
+    accept_language = request.headers.get("accept-language")
+
+    if not user_agent:
+        raise HTTPException(status_code=400, detail="User-Agent header is required")
+    if not accept_language:
+        raise HTTPException(status_code=400, detail="Accept-Language header is required")
+
+    return {
+        "User-Agent": user_agent,
+        "Accept-Language": accept_language,
+    }
