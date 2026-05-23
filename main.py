@@ -1,12 +1,14 @@
 import os
+import re
 import time
 import uuid
-from typing import Optional
+from datetime import datetime
+from typing import Annotated, Optional
 
-from fastapi import Body, Cookie, FastAPI, Form, HTTPException, Query, Request, Response
+from fastapi import Body, Cookie, Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from itsdangerous import BadSignature, Signer
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
 
 app = FastAPI()
 
@@ -85,6 +87,48 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     message: str = Field(..., examples=["Login successful"])
+
+
+ACCEPT_LANGUAGE_PATTERN = re.compile(
+    r"^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})?"
+    r"(\s*;\s*q=(0(\.\d+)?|1(\.0+)?))?"
+    r"(,\s*[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})?(\s*;\s*q=(0(\.\d+)?|1(\.0+)?))?)*$"
+)
+
+
+class CommonHeaders(BaseModel):
+    user_agent: str = Field(..., description='Значение заголовка "User-Agent"')
+    accept_language: str = Field(..., description='Значение заголовка "Accept-Language"')
+
+    @field_validator("accept_language")
+    @classmethod
+    def validate_accept_language(cls, value: str) -> str:
+        if not ACCEPT_LANGUAGE_PATTERN.fullmatch(value.strip()):
+            raise ValueError(
+                "Invalid Accept-Language format. Expected pattern like 'en-US,en;q=0.9,es;q=0.8'"
+            )
+        return value.strip()
+
+
+def get_common_headers(
+    user_agent: str = Header(..., alias="User-Agent"),
+    accept_language: str = Header(..., alias="Accept-Language"),
+) -> CommonHeaders:
+    try:
+        return CommonHeaders(user_agent=user_agent, accept_language=accept_language)
+    except ValidationError as exc:
+        first_error = exc.errors()[0]
+        raise HTTPException(
+            status_code=400,
+            detail=str(first_error.get("msg", "Invalid request headers")),
+        ) from exc
+
+
+def common_headers_to_dict(headers: CommonHeaders) -> dict[str, str]:
+    return {
+        "User-Agent": headers.user_agent,
+        "Accept-Language": headers.accept_language,
+    }
 
 
 def verify_credentials(username: str, password: str) -> bool:
@@ -300,16 +344,19 @@ def get_user_profile(
 
 
 @app.get("/headers")
-def get_request_headers(request: Request) -> dict[str, str]:
-    user_agent = request.headers.get("user-agent")
-    accept_language = request.headers.get("accept-language")
+def get_request_headers(
+    headers: Annotated[CommonHeaders, Depends(get_common_headers)],
+) -> dict[str, str]:
+    return common_headers_to_dict(headers)
 
-    if not user_agent:
-        raise HTTPException(status_code=400, detail="User-Agent header is required")
-    if not accept_language:
-        raise HTTPException(status_code=400, detail="Accept-Language header is required")
 
+@app.get("/info")
+def get_info(
+    response: Response,
+    headers: Annotated[CommonHeaders, Depends(get_common_headers)],
+) -> dict:
+    response.headers["X-Server-Time"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     return {
-        "User-Agent": user_agent,
-        "Accept-Language": accept_language,
+        "message": "Добро пожаловать! Ваши заголовки успешно обработаны.",
+        "headers": common_headers_to_dict(headers),
     }
