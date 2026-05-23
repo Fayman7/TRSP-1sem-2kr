@@ -5,14 +5,20 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Optional
 
+from dotenv import load_dotenv
 from fastapi import Body, Cookie, Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from itsdangerous import BadSignature, Signer
 from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
 
+load_dotenv()
+
 app = FastAPI()
 
+MODE = os.getenv("MODE", "dev").lower()
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-for-cookie-signing")
+DOCS_USER = os.getenv("DOCS_USER", "")
+DOCS_PASSWORD = os.getenv("DOCS_PASSWORD", "")
 SESSION_SIGNER = Signer(SECRET_KEY)
 
 SESSION_INACTIVITY_TIMEOUT = 300  # сессия истекает через 5 минут без активности
@@ -201,7 +207,7 @@ def set_session_cookie(response: Response, user_id: str, last_activity: int) -> 
         value=create_signed_session_token(user_id, last_activity),
         httponly=True,
         max_age=SESSION_COOKIE_MAX_AGE,
-        secure=False,
+        secure=MODE == "prod",
         samesite="lax",
     )
 

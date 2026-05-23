@@ -1,0 +1,26 @@
+# Секреты и локальная конфигурация
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# Инструменты и IDE
+.idea/
+.vscode/
+*.swp
+
+# Тестовые артефакты
+cookies.txt
+*.log
+
+# ОС
+.DS_Store
+Thumbs.db
